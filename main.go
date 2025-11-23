@@ -30,6 +30,7 @@ type Room struct {
 	Timer     int                `json:"timer"`
 
 	SecretWord string `json:"secretWord,omitempty"`
+	RoundEndByTimeout bool `json:"roundEndByTimeout"`
 
 	Players map[string]*Player `json:"players"`
 	Votes map[string]string `json:"-"`
@@ -112,14 +113,15 @@ func broadcastRoom(room *Room) {
 	defer room.mu.Unlock()
 
 	snap := &Room{
-		Code:       room.Code,
-		State:      room.State,
-		HostID:     room.HostID,
-		JudgeID:    room.JudgeID,
-		InsiderID:  room.InsiderID,
-		Timer:      room.Timer,
-		SecretWord: room.SecretWord,
-		Players:    make(map[string]*Player),
+		Code:             room.Code,
+		State:            room.State,
+		HostID:           room.HostID,
+		JudgeID:          room.JudgeID,
+		InsiderID:        room.InsiderID,
+		Timer:            room.Timer,
+		SecretWord:       room.SecretWord,
+		RoundEndByTimeout: room.RoundEndByTimeout,
+		Players:          make(map[string]*Player),
 	}
 
 	for id, p := range room.Players {
@@ -148,13 +150,15 @@ func sendRoomToPlayer(room *Room, player *Player) {
 	defer room.mu.Unlock()
 
 	snap := &Room{
-		Code:      room.Code,
-		State:     room.State,
-		HostID:    room.HostID,
-		JudgeID:   room.JudgeID,
-		InsiderID: room.InsiderID,
-		Timer:     room.Timer,
-		Players:   make(map[string]*Player),
+		Code:             room.Code,
+		State:            room.State,
+		HostID:           room.HostID,
+		JudgeID:          room.JudgeID,
+		InsiderID:        room.InsiderID,
+		Timer:            room.Timer,
+		SecretWord:       room.SecretWord,
+		RoundEndByTimeout: room.RoundEndByTimeout,
+		Players:          make(map[string]*Player),
 	}
 
 	for id, p := range room.Players {
@@ -181,7 +185,6 @@ func sendError(conn *websocket.Conn, text string) {
 	})
 }
 
-// แจก role ให้ทุกคน + random insider (ไม่นับกรรมการ)
 func assignRoles(room *Room) {
 	room.mu.Lock()
 	defer room.mu.Unlock()
@@ -223,6 +226,10 @@ func startCountdownTimer(room *Room, duration int) {
 	room.State = "countdown"
 	room.timerRunning = true
 	room.timerCancel = make(chan struct{})
+
+	// 👇 เริ่มรอบใหม่ ถือว่ายังไม่ได้ timeout
+	room.RoundEndByTimeout = false
+
 	cancelChan := room.timerCancel
 	room.mu.Unlock()
 
@@ -242,13 +249,20 @@ func startCountdownTimer(room *Room, duration int) {
 					r.Timer--
 				}
 				if r.Timer <= 0 {
+					// ❗ เคสเวลาหมด แต่ไม่มีใครกดทายถูก
 					r.Timer = 0
 					r.timerRunning = false
-					r.State = "voting"
+
+					// รอบนี้จบเพราะ timeout
+					r.State = "scoreboard"
+					r.RoundEndByTimeout = true
+
+					// ไม่มีโหวต → ล้าง votes ทิ้ง
 					r.Votes = make(map[string]string)
+
 					r.mu.Unlock()
 					broadcastRoom(r)
-					startVoteTimer(r, VoteDurationSeconds)
+					// ❌ ไม่ต้อง startVoteTimer อีกแล้ว
 					return
 				}
 				r.mu.Unlock()
@@ -259,6 +273,7 @@ func startCountdownTimer(room *Room, duration int) {
 		}
 	}(room, cancelChan)
 }
+
 
 
 func startVoteTimer(room *Room, duration int) {
@@ -307,6 +322,7 @@ func startVoteTimer(room *Room, duration int) {
 
 func handleGuessCorrect(room *Room) {
 	room.mu.Lock()
+
 	if room.timerRunning {
 		room.timerRunning = false
 		if room.timerCancel != nil {
@@ -315,6 +331,7 @@ func handleGuessCorrect(room *Room) {
 		}
 	}
 
+	room.RoundEndByTimeout = false
 
 	for _, p := range room.Players {
 		if p.ID == room.InsiderID || p.ID == room.JudgeID {
@@ -322,11 +339,14 @@ func handleGuessCorrect(room *Room) {
 		}
 		p.Score++
 	}
+	room.State = "voting"
+	room.Votes = make(map[string]string)
 
 	room.mu.Unlock()
-	startVoteTimer(room, VoteDurationSeconds)
 	broadcastRoom(room)
+	startVoteTimer(room, VoteDurationSeconds)
 }
+
 
 
 func handleTallyVotes(room *Room) {
@@ -336,7 +356,7 @@ func handleTallyVotes(room *Room) {
 	if len(room.Players) == 0 {
 		return
 	}
-
+	room.RoundEndByTimeout = false
 	count := make(map[string]int)
 	for _, suspectID := range room.Votes {
 		count[suspectID]++
@@ -378,11 +398,11 @@ func handleTallyVotes(room *Room) {
 func handleNextRound(room *Room) {
 	room.mu.Lock()
 	defer room.mu.Unlock()
+
 	for _, p := range room.Players {
 		p.Role = ""
 	}
 	room.InsiderID = ""
-	room.SecretWord = ""
 	room.Timer = 0
 	room.timerRunning = false
 	if room.timerCancel != nil {
@@ -391,7 +411,9 @@ func handleNextRound(room *Room) {
 	}
 	room.State = "lobby"
 	room.Votes = make(map[string]string)
+	room.RoundEndByTimeout = false
 }
+
 
 func wsHandler(c *websocket.Conn) {
 	roomCode := c.Query("room")
@@ -575,6 +597,59 @@ func wsHandler(c *websocket.Conn) {
 		case "next_round":
 			handleNextRound(room)
 			broadcastRoom(room)
+
+
+		        case "kick":
+            room.mu.Lock()
+
+            // อนุญาตเฉพาะ Host เท่านั้น
+            if room.HostID != playerID {
+                room.mu.Unlock()
+                sendError(c, "เฉพาะ Host เท่านั้นที่เตะผู้เล่นได้")
+                continue
+            }
+
+            if msg.TargetID == "" {
+                room.mu.Unlock()
+                sendError(c, "targetId is required")
+                continue
+            }
+
+            // ห้ามเตะตัวเอง (Host)
+            if msg.TargetID == room.HostID {
+                room.mu.Unlock()
+                sendError(c, "ไม่สามารถเตะตัวเองได้")
+                continue
+            }
+
+            target, ok := room.Players[msg.TargetID]
+            if !ok {
+                room.mu.Unlock()
+                sendError(c, "ผู้เล่นที่ต้องการเตะไม่อยู่ในห้องแล้ว")
+                continue
+            }
+
+            // ถ้าโดนเตะเป็นกรรมการ → ล้าง judge
+            if room.JudgeID == msg.TargetID {
+                room.JudgeID = ""
+            }
+
+            // ลบออกจากห้อง
+            delete(room.Players, msg.TargetID)
+            room.mu.Unlock()
+
+            // ส่งข้อความไปบอกคนโดนเตะ แล้วปิด connection
+            if target.Conn != nil {
+                _ = target.Conn.WriteJSON(ErrorMessage{
+                    Type:    "error",
+                    Message: "คุณถูกเชิญออกจากห้องโดย Host",
+                })
+                _ = target.Conn.Close()
+            }
+
+            broadcastRoom(room)
+            deleteRoomIfEmpty(room)
+
 
 		default:
 			sendError(c, "unknown message type: "+msg.Type)
