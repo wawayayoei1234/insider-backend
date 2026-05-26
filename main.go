@@ -34,6 +34,8 @@ type Room struct {
 	RoundEndByTimeout bool   `json:"roundEndByTimeout"`
 	ChatEnabled       bool   `json:"chatEnabled"`
 
+	CorrectGuesserID string `json:"correctGuesserId,omitempty"`
+
 	BlockedVoters map[string]bool `json:"blockedVoters,omitempty"`
 	Voted         map[string]bool `json:"voted,omitempty"`
 	LastVotes     []VotePair      `json:"lastVotes,omitempty"`
@@ -41,8 +43,9 @@ type Room struct {
 	Players map[string]*Player `json:"players"`
 	Votes   map[string]string  `json:"-"`
 
-	timerRunning bool
-	timerCancel  chan struct{}
+	timerRunning      bool
+	timerCancel       chan struct{}
+	voteTimerDuration int
 
 	mu sync.Mutex
 }
@@ -64,13 +67,14 @@ type ErrorMessage struct {
 }
 
 type ClientMessage struct {
-	Type        string `json:"type"`
-	TargetID    string `json:"targetId,omitempty"`
-	Duration    int    `json:"duration,omitempty"`
-	SuspectID   string `json:"suspectId,omitempty"`
-	SecretWord  string `json:"secretWord,omitempty"`
-	Text        string `json:"text,omitempty"`
-	ChatEnabled *bool  `json:"chatEnabled,omitempty"`
+	Type             string `json:"type"`
+	TargetID         string `json:"targetId,omitempty"`
+	Duration         int    `json:"duration,omitempty"`
+	SuspectID        string `json:"suspectId,omitempty"`
+	SecretWord       string `json:"secretWord,omitempty"`
+	Text             string `json:"text,omitempty"`
+	ChatEnabled      *bool  `json:"chatEnabled,omitempty"`
+	CorrectGuesserID string `json:"correctGuesserId,omitempty"`
 }
 
 type ChatFrom struct {
@@ -155,6 +159,7 @@ func broadcastRoom(room *Room) {
 		SecretWord:        room.SecretWord,
 		RoundEndByTimeout: room.RoundEndByTimeout,
 		ChatEnabled:       room.ChatEnabled,
+		CorrectGuesserID:  room.CorrectGuesserID,
 
 		BlockedVoters: make(map[string]bool),
 		Voted:         make(map[string]bool),
@@ -204,6 +209,7 @@ func sendRoomToPlayer(room *Room, player *Player) {
 		SecretWord:        room.SecretWord,
 		RoundEndByTimeout: room.RoundEndByTimeout,
 		ChatEnabled:       room.ChatEnabled,
+		CorrectGuesserID:  room.CorrectGuesserID,
 
 		BlockedVoters: make(map[string]bool),
 		Voted:         make(map[string]bool),
@@ -285,6 +291,7 @@ func startCountdownTimer(room *Room, duration int) {
 	room.timerCancel = make(chan struct{})
 
 	room.RoundEndByTimeout = false
+	room.CorrectGuesserID = ""
 	room.BlockedVoters = make(map[string]bool)
 	room.Voted = make(map[string]bool)
 	room.LastVotes = []VotePair{}
@@ -333,6 +340,7 @@ func startVoteTimer(room *Room, duration int) {
 		close(room.timerCancel)
 	}
 	room.Timer = duration
+	room.voteTimerDuration = duration
 	room.State = "voting"
 	room.timerRunning = true
 	room.timerCancel = make(chan struct{})
@@ -358,8 +366,17 @@ func startVoteTimer(room *Room, duration int) {
 					r.Timer = 0
 					r.timerRunning = false
 					r.mu.Unlock()
-					handleTallyVotes(r)
+					needRevote := handleTallyVotes(r)
 					broadcastRoom(r)
+					if needRevote {
+						r.mu.Lock()
+						newDuration := r.voteTimerDuration / 2
+						if newDuration < 15 {
+							newDuration = 15
+						}
+						r.mu.Unlock()
+						startVoteTimer(r, newDuration)
+					}
 					return
 				}
 				r.mu.Unlock()
@@ -371,7 +388,7 @@ func startVoteTimer(room *Room, duration int) {
 	}(room, cancelChan)
 }
 
-func handleGuessCorrect(room *Room) {
+func handleGuessCorrect(room *Room, correctGuesserID string) {
 	room.mu.Lock()
 	if room.timerRunning {
 		room.timerRunning = false
@@ -382,6 +399,7 @@ func handleGuessCorrect(room *Room) {
 	}
 	// ทายถูก → ไป phase โหวต (คะแนนไปตัดสินที่ handleTallyVotes)
 	room.RoundEndByTimeout = false
+	room.CorrectGuesserID = correctGuesserID
 	room.State = "voting"
 	room.Votes = make(map[string]string)
 	room.Voted = make(map[string]bool)
@@ -393,40 +411,34 @@ func handleGuessCorrect(room *Room) {
 	startVoteTimer(room, VoteDurationSeconds)
 }
 
-func handleTallyVotes(room *Room) {
+// handleTallyVotes tallies votes and returns true if a revote is needed.
+func handleTallyVotes(room *Room) bool {
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
 	if len(room.Players) == 0 {
-		return
+		return false
 	}
 
-	// เก็บประวัติว่าใครโหวตใคร
 	lastVotes := make([]VotePair, 0, len(room.Votes))
 	for voterID, targetID := range room.Votes {
-		lastVotes = append(lastVotes, VotePair{
-			VoterID:  voterID,
-			TargetID: targetID,
-		})
+		lastVotes = append(lastVotes, VotePair{VoterID: voterID, TargetID: targetID})
 	}
 	room.LastVotes = lastVotes
 
-	// นับคะแนน
 	count := make(map[string]int)
 	for _, suspectID := range room.Votes {
 		count[suspectID]++
 	}
 
 	if len(count) == 0 {
-		// ไม่มีใครโหวต → จบรอบ แบบไม่มีใครได้แต้มเพิ่ม
 		room.State = "scoreboard"
 		room.Votes = make(map[string]string)
 		room.Voted = make(map[string]bool)
 		room.BlockedVoters = make(map[string]bool)
-		return
+		return false
 	}
 
-	// หา max vote
 	maxVote := -1
 	for _, c := range count {
 		if c > maxVote {
@@ -434,7 +446,6 @@ func handleTallyVotes(room *Room) {
 		}
 	}
 
-	// คนที่ได้คะแนนสูงสุด
 	top := []string{}
 	for id, c := range count {
 		if c == maxVote {
@@ -442,25 +453,45 @@ func handleTallyVotes(room *Room) {
 		}
 	}
 
-	// เสมอ → โหวตรอบใหม่ โดย "ผู้ต้องสงสัยที่คะแนนเท่ากัน" ถูก block ไม่ให้โหวต
-	if len(top) > 1 {
-		room.State = "voting"
-		room.Votes = make(map[string]string)
-		room.Voted = make(map[string]bool)
+	var votedID string
 
-		room.BlockedVoters = make(map[string]bool)
+	if len(top) > 1 {
+		// Accumulate: block all tied players across revote rounds
+		if room.BlockedVoters == nil {
+			room.BlockedVoters = make(map[string]bool)
+		}
 		for _, id := range top {
 			room.BlockedVoters[id] = true
 		}
-		return
+
+		// Count eligible voters remaining (not judge, not blocked)
+		remaining := 0
+		for id := range room.Players {
+			if id == room.JudgeID {
+				continue
+			}
+			if room.BlockedVoters[id] {
+				continue
+			}
+			remaining++
+		}
+
+		if remaining > 0 {
+			// Need another revote round
+			room.State = "voting"
+			room.Votes = make(map[string]string)
+			room.Voted = make(map[string]bool)
+			return true
+		}
+
+		// Edge case: everyone is blocked — pick a random loser from the tied group
+		votedID = top[rand.Intn(len(top))]
+	} else {
+		votedID = top[0]
 	}
 
-	// มีผู้ถูกโหวตชัดเจน
-	votedID := top[0]
 	isCorrect := votedID == room.InsiderID
-
 	if isCorrect {
-		// โหวตโดน Insider → คนทั่วไปชนะ (ไม่รวม Insider / Judge)
 		for _, p := range room.Players {
 			if p.ID == room.InsiderID || p.ID == room.JudgeID {
 				continue
@@ -468,9 +499,8 @@ func handleTallyVotes(room *Room) {
 			p.Score++
 		}
 	} else {
-		// โหวตผิด → Insider ชนะคนเดียว
 		if ins, ok := room.Players[room.InsiderID]; ok {
-			ins.Score += 2 // จะปรับเป็น 1 แต้มก็ได้
+			ins.Score += 2
 		}
 	}
 
@@ -478,6 +508,7 @@ func handleTallyVotes(room *Room) {
 	room.Votes = make(map[string]string)
 	room.Voted = make(map[string]bool)
 	room.BlockedVoters = make(map[string]bool)
+	return false
 }
 
 func handleNextRound(room *Room) {
@@ -497,6 +528,7 @@ func handleNextRound(room *Room) {
 	room.State = "lobby"
 	room.Votes = make(map[string]string)
 	room.RoundEndByTimeout = false
+	room.CorrectGuesserID = ""
 	room.BlockedVoters = make(map[string]bool)
 	room.Voted = make(map[string]bool)
 	room.LastVotes = []VotePair{}
@@ -638,7 +670,7 @@ func wsHandler(c *websocket.Conn) {
 				sendError(c, "เฉพาะกรรมการเท่านั้นที่กดทายถูกได้")
 				continue
 			}
-			handleGuessCorrect(room)
+			handleGuessCorrect(room, msg.CorrectGuesserID)
 
 		case "vote_insider":
 			if msg.SuspectID == "" {
@@ -710,8 +742,17 @@ func wsHandler(c *websocket.Conn) {
 					}
 				}
 				room.mu.Unlock()
-				handleTallyVotes(room)
+				needRevote := handleTallyVotes(room)
 				broadcastRoom(room)
+				if needRevote {
+					room.mu.Lock()
+					newDuration := room.voteTimerDuration / 2
+					if newDuration < 15 {
+						newDuration = 15
+					}
+					room.mu.Unlock()
+					startVoteTimer(room, newDuration)
+				}
 			} else {
 				room.mu.Unlock()
 				broadcastRoom(room)
