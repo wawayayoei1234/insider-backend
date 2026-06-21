@@ -910,10 +910,11 @@ func wsHandler(c *websocket.Conn) {
 				continue
 			}
 			// T3/T2: validate BEFORE mutating room state.
-			secret := strings.TrimSpace(msg.SecretWord)
-			// T7: random word from the server-side word bank.
-			if secret == "" && msg.Random {
+			var secret string
+			if msg.Random {
 				secret = pickRandomWord(msg.Category)
+			} else {
+				secret = strings.TrimSpace(msg.SecretWord)
 			}
 			hasJudge := room.JudgeID != ""
 			nonJudgeCount := 0
@@ -931,9 +932,9 @@ func wsHandler(c *websocket.Conn) {
 				sendError(c, "กรรมการต้องกำหนดคำปริศนาก่อนเริ่มเกม")
 				continue
 			}
-			if !hasJudge || nonJudgeCount < 3 {
+			if !hasJudge || nonJudgeCount < 1 {
 				room.mu.Unlock()
-				sendError(c, "ต้องมีผู้เล่น (ไม่นับกรรมการ) อย่างน้อย 3 คน")
+				sendError(c, "ต้องมีผู้เล่น (ไม่นับกรรมการ) อย่างน้อย 1 คน")
 				continue
 			}
 			room.SecretWord = secret
