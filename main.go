@@ -15,11 +15,16 @@ import (
 )
 
 type Player struct {
-	ID    string          `json:"id"`
-	Name  string          `json:"name"`
-	Score int             `json:"score"`
-	Role  string          `json:"role"`
-	Conn  *websocket.Conn `json:"-"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Score     int             `json:"score"`
+	Role      string          `json:"role"`
+	Connected bool            `json:"connected"`
+	Spectator bool            `json:"spectator,omitempty"`
+	Token     string          `json:"-"`
+	Conn      *websocket.Conn `json:"-"`
+	lastChat  time.Time
+	lastReact time.Time
 }
 
 type Room struct {
@@ -35,6 +40,9 @@ type Room struct {
 	ChatEnabled       bool   `json:"chatEnabled"`
 
 	CorrectGuesserID string `json:"correctGuesserId,omitempty"`
+
+	Hints         []string `json:"hints,omitempty"`         // T8: ใบ้สาธารณะจากกรรมการ
+	QuestionCount int      `json:"questionCount,omitempty"` // T8: ตัวนับจำนวนคำถาม
 
 	BlockedVoters map[string]bool `json:"blockedVoters,omitempty"`
 	Voted         map[string]bool `json:"voted,omitempty"`
@@ -56,12 +64,26 @@ type VotePair struct {
 }
 
 type OutgoingRoomMessage struct {
-	Type   string `json:"type"`
-	SelfID string `json:"selfId,omitempty"`
-	Room   *Room  `json:"room"`
+	Type       string   `json:"type"`
+	SelfID     string   `json:"selfId,omitempty"`
+	Token      string   `json:"token,omitempty"`
+	Categories []string `json:"categories,omitempty"` // T7: รายชื่อหมวดคำ (ส่งครั้งเดียวตอน join)
+	Room       *Room    `json:"room"`
+}
+
+type ReactionPayload struct {
+	Type  string   `json:"type"`
+	From  ChatFrom `json:"from"`
+	Emoji string   `json:"emoji"`
+	Ts    int64    `json:"ts"`
 }
 
 type ErrorMessage struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+type NoticeMessage struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
 }
@@ -75,6 +97,9 @@ type ClientMessage struct {
 	Text             string `json:"text,omitempty"`
 	ChatEnabled      *bool  `json:"chatEnabled,omitempty"`
 	CorrectGuesserID string `json:"correctGuesserId,omitempty"`
+	Category         string `json:"category,omitempty"` // T7
+	Random           bool   `json:"random,omitempty"`   // T7
+	Emoji            string `json:"emoji,omitempty"`    // T10
 }
 
 type ChatFrom struct {
@@ -92,6 +117,18 @@ type ChatPayload struct {
 const (
 	RoundDurationSeconds = 300
 	VoteDurationSeconds  = 90
+
+	// T12 hardening
+	MaxPlayers      = 12
+	MaxNameLen      = 24
+	ChatMinInterval = 500 * time.Millisecond
+	MaxChatLen      = 300
+
+	// T8 / T10
+	MaxHints         = 10
+	MaxHintLen       = 80
+	MaxEmojiLen      = 16
+	ReactMinInterval = 400 * time.Millisecond
 )
 
 var (
@@ -132,39 +169,103 @@ func getOrCreateRoom(code string, create bool) (*Room, bool) {
 	return room, true
 }
 
-func deleteRoomIfEmpty(room *Room) {
+func deleteRoom(room *Room) {
 	roomsMu.Lock()
 	defer roomsMu.Unlock()
-
-	if len(room.Players) == 0 {
-		delete(rooms, room.Code)
-	}
+	delete(rooms, room.Code)
 }
 
 func makePlayerID() string {
 	return strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.Itoa(rand.Intn(100000))
 }
 
-func broadcastRoom(room *Room) {
-	room.mu.Lock()
-	defer room.mu.Unlock()
+func makeToken() string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
 
+// countConnected returns the number of players still connected.
+// Caller must hold room.mu.
+func countConnected(room *Room) int {
+	n := 0
+	for _, p := range room.Players {
+		if p.Connected {
+			n++
+		}
+	}
+	return n
+}
+
+// eligibleVoters counts players allowed to vote this round:
+// not the judge, not blocked, and currently connected (T6).
+// Caller must hold room.mu.
+func eligibleVoters(room *Room) int {
+	n := 0
+	for id, p := range room.Players {
+		if id == room.JudgeID {
+			continue
+		}
+		if p.Spectator {
+			continue
+		}
+		if room.BlockedVoters != nil && room.BlockedVoters[id] {
+			continue
+		}
+		if !p.Connected {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// countActivePlayers counts non-spectator seats (used for the room cap).
+// Caller must hold room.mu.
+func countActivePlayers(room *Room) int {
+	n := 0
+	for _, p := range room.Players {
+		if !p.Spectator {
+			n++
+		}
+	}
+	return n
+}
+
+// buildSnapshotFor builds a per-recipient redacted snapshot (T1).
+// Secret word goes only to judge + insider; every player's role is hidden
+// except the viewer's own; the insider's identity is revealed only on the
+// scoreboard. Tokens are never serialized. Caller must hold room.mu.
+func buildSnapshotFor(room *Room, viewerID string) *Room {
 	snap := &Room{
 		Code:              room.Code,
 		State:             room.State,
 		HostID:            room.HostID,
 		JudgeID:           room.JudgeID,
-		InsiderID:         room.InsiderID,
 		Timer:             room.Timer,
-		SecretWord:        room.SecretWord,
 		RoundEndByTimeout: room.RoundEndByTimeout,
 		ChatEnabled:       room.ChatEnabled,
 		CorrectGuesserID:  room.CorrectGuesserID,
+		Hints:             append([]string(nil), room.Hints...),
+		QuestionCount:     room.QuestionCount,
 
 		BlockedVoters: make(map[string]bool),
 		Voted:         make(map[string]bool),
 		LastVotes:     append([]VotePair(nil), room.LastVotes...),
 		Players:       make(map[string]*Player),
+	}
+
+	// Secret word: only judge + insider may see it.
+	if viewerID == room.JudgeID || viewerID == room.InsiderID {
+		snap.SecretWord = room.SecretWord
+	}
+
+	// Insider identity: revealed only on scoreboard.
+	if room.State == "scoreboard" {
+		snap.InsiderID = room.InsiderID
 	}
 
 	for id, b := range room.BlockedVoters {
@@ -175,23 +276,37 @@ func broadcastRoom(room *Room) {
 	}
 
 	for id, p := range room.Players {
+		role := ""
+		if id == viewerID {
+			// Viewer always sees their own role.
+			role = p.Role
+		}
 		snap.Players[id] = &Player{
-			ID:    p.ID,
-			Name:  p.Name,
-			Score: p.Score,
-			Role:  p.Role,
+			ID:        p.ID,
+			Name:      p.Name,
+			Score:     p.Score,
+			Role:      role,
+			Connected: p.Connected,
+			Spectator: p.Spectator,
 		}
 	}
+
+	return snap
+}
+
+func broadcastRoom(room *Room) {
+	room.mu.Lock()
+	defer room.mu.Unlock()
 
 	for _, p := range room.Players {
 		if p.Conn == nil {
 			continue
 		}
-		msg := OutgoingRoomMessage{
+		snap := buildSnapshotFor(room, p.ID)
+		_ = p.Conn.WriteJSON(OutgoingRoomMessage{
 			Type: "room",
 			Room: snap,
-		}
-		_ = p.Conn.WriteJSON(msg)
+		})
 	}
 }
 
@@ -199,46 +314,26 @@ func sendRoomToPlayer(room *Room, player *Player) {
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
-	snap := &Room{
-		Code:              room.Code,
-		State:             room.State,
-		HostID:            room.HostID,
-		JudgeID:           room.JudgeID,
-		InsiderID:         room.InsiderID,
-		Timer:             room.Timer,
-		SecretWord:        room.SecretWord,
-		RoundEndByTimeout: room.RoundEndByTimeout,
-		ChatEnabled:       room.ChatEnabled,
-		CorrectGuesserID:  room.CorrectGuesserID,
-
-		BlockedVoters: make(map[string]bool),
-		Voted:         make(map[string]bool),
-		LastVotes:     append([]VotePair(nil), room.LastVotes...),
-		Players:       make(map[string]*Player),
-	}
-
-	for id, b := range room.BlockedVoters {
-		snap.BlockedVoters[id] = b
-	}
-	for id, v := range room.Voted {
-		snap.Voted[id] = v
-	}
-
-	for id, p := range room.Players {
-		snap.Players[id] = &Player{
-			ID:    p.ID,
-			Name:  p.Name,
-			Score: p.Score,
-			Role:  p.Role,
-		}
-	}
-
+	snap := buildSnapshotFor(room, player.ID)
 	msg := OutgoingRoomMessage{
-		Type:   "room",
-		SelfID: player.ID,
-		Room:   snap,
+		Type:       "room",
+		SelfID:     player.ID,
+		Token:      player.Token, // self-only; never sent to others
+		Categories: categories(), // T7: ส่งรายชื่อหมวดครั้งเดียวตอน join
+		Room:       snap,
 	}
 	_ = player.Conn.WriteJSON(msg)
+}
+
+func broadcastNotice(room *Room, text string) {
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	for _, p := range room.Players {
+		if p.Conn == nil {
+			continue
+		}
+		_ = p.Conn.WriteJSON(NoticeMessage{Type: "notice", Message: text})
+	}
 }
 
 func sendError(conn *websocket.Conn, text string) {
@@ -254,6 +349,9 @@ func assignRoles(room *Room) {
 
 	room.InsiderID = ""
 	for _, p := range room.Players {
+		if p.Spectator {
+			continue
+		}
 		p.Role = "normal"
 	}
 	if room.JudgeID != "" {
@@ -262,9 +360,13 @@ func assignRoles(room *Room) {
 		}
 	}
 
+	// Only connected, non-judge, non-spectator players can be the insider.
 	candidates := make([]*Player, 0)
 	for _, p := range room.Players {
 		if p.ID == room.JudgeID {
+			continue
+		}
+		if p.Spectator || !p.Connected {
 			continue
 		}
 		candidates = append(candidates, p)
@@ -295,6 +397,8 @@ func startCountdownTimer(room *Room, duration int) {
 	room.BlockedVoters = make(map[string]bool)
 	room.Voted = make(map[string]bool)
 	room.LastVotes = []VotePair{}
+	room.Hints = nil
+	room.QuestionCount = 0
 
 	cancelChan := room.timerCancel
 	room.mu.Unlock()
@@ -464,17 +568,8 @@ func handleTallyVotes(room *Room) bool {
 			room.BlockedVoters[id] = true
 		}
 
-		// Count eligible voters remaining (not judge, not blocked)
-		remaining := 0
-		for id := range room.Players {
-			if id == room.JudgeID {
-				continue
-			}
-			if room.BlockedVoters[id] {
-				continue
-			}
-			remaining++
-		}
+		// Count eligible voters remaining (not judge, not blocked, connected)
+		remaining := eligibleVoters(room)
 
 		if remaining > 0 {
 			// Need another revote round
@@ -484,7 +579,7 @@ func handleTallyVotes(room *Room) bool {
 			return true
 		}
 
-		// Edge case: everyone is blocked — pick a random loser from the tied group
+		// Edge case: no eligible voters left — pick a random loser from the tied group
 		votedID = top[rand.Intn(len(top))]
 	} else {
 		votedID = top[0]
@@ -493,7 +588,7 @@ func handleTallyVotes(room *Room) bool {
 	isCorrect := votedID == room.InsiderID
 	if isCorrect {
 		for _, p := range room.Players {
-			if p.ID == room.InsiderID || p.ID == room.JudgeID {
+			if p.ID == room.InsiderID || p.ID == room.JudgeID || p.ID == room.CorrectGuesserID {
 				continue
 			}
 			p.Score++
@@ -515,6 +610,29 @@ func handleNextRound(room *Room) {
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
+	// T6: cleanup offline (ghost) seats when returning to lobby.
+	for id, p := range room.Players {
+		if !p.Connected {
+			delete(room.Players, id)
+			if room.HostID == id {
+				room.HostID = ""
+			}
+			if room.JudgeID == id {
+				room.JudgeID = ""
+			}
+		}
+	}
+	// Ensure there is a host among remaining players.
+	if _, ok := room.Players[room.HostID]; !ok || room.HostID == "" {
+		room.HostID = ""
+		for id, p := range room.Players {
+			if p.Connected {
+				room.HostID = id
+				break
+			}
+		}
+	}
+
 	for _, p := range room.Players {
 		p.Role = ""
 	}
@@ -526,18 +644,38 @@ func handleNextRound(room *Room) {
 		room.timerCancel = nil
 	}
 	room.State = "lobby"
+	room.SecretWord = ""
 	room.Votes = make(map[string]string)
 	room.RoundEndByTimeout = false
 	room.CorrectGuesserID = ""
 	room.BlockedVoters = make(map[string]bool)
 	room.Voted = make(map[string]bool)
 	room.LastVotes = []VotePair{}
+	room.Hints = nil
+	room.QuestionCount = 0
+}
+
+func sanitizeName(name string) string {
+	name = strings.TrimSpace(name)
+	// Collapse newlines/tabs to spaces.
+	name = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, name)
+	runes := []rune(name)
+	if len(runes) > MaxNameLen {
+		runes = runes[:MaxNameLen]
+	}
+	return strings.TrimSpace(string(runes))
 }
 
 func wsHandler(c *websocket.Conn) {
 	roomCode := c.Query("room")
-	playerName := c.Query("name")
+	playerName := sanitizeName(c.Query("name"))
 	mode := c.Query("mode")
+	token := c.Query("token")
 
 	if roomCode == "" || playerName == "" {
 		sendError(c, "missing room or name")
@@ -557,46 +695,152 @@ func wsHandler(c *websocket.Conn) {
 		return
 	}
 
-	playerID := makePlayerID()
-	player := &Player{
-		ID:    playerID,
-		Name:  playerName,
-		Score: 0,
-		Role:  "",
-		Conn:  c,
-	}
+	var player *Player
+	reattached := false
 
 	room.mu.Lock()
-	room.Players[playerID] = player
-	if room.HostID == "" {
-		room.HostID = playerID
+	// T4: try to re-attach to an existing seat via reconnect token.
+	if token != "" {
+		for _, p := range room.Players {
+			if p.Token == token {
+				player = p
+				break
+			}
+		}
 	}
+
+	if player != nil {
+		// Close any stale connection still bound to this seat (e.g. duplicate tab).
+		if player.Conn != nil {
+			_ = player.Conn.Close()
+		}
+		player.Conn = c
+		player.Connected = true
+		player.Name = playerName
+		reattached = true
+		// Restore host if the seat had become host while offline-less, or if no host
+		// (spectators never become host).
+		if room.HostID == "" && !player.Spectator {
+			room.HostID = player.ID
+		}
+	} else {
+		isSpectator := mode == "spectate"
+		// T12: enforce room capacity for brand-new (non-spectator) seats.
+		if !isSpectator && countActivePlayers(room) >= MaxPlayers {
+			room.mu.Unlock()
+			sendError(c, "ห้องเต็มแล้ว (สูงสุด "+strconv.Itoa(MaxPlayers)+" คน)")
+			_ = c.Close()
+			return
+		}
+		playerID := makePlayerID()
+		player = &Player{
+			ID:        playerID,
+			Name:      playerName,
+			Score:     0,
+			Role:      "",
+			Connected: true,
+			Spectator: isSpectator,
+			Token:     makeToken(),
+			Conn:      c,
+		}
+		room.Players[playerID] = player
+		if room.HostID == "" && !isSpectator {
+			room.HostID = playerID
+		}
+	}
+	playerID := player.ID
 	room.mu.Unlock()
 
 	sendRoomToPlayer(room, player)
 	broadcastRoom(room)
 
-	log.Printf("[WS] %s joined room %s (mode=%s)\n", playerName, roomCode, mode)
+	if reattached {
+		log.Printf("[WS] %s re-attached to room %s\n", playerName, roomCode)
+	} else {
+		log.Printf("[WS] %s joined room %s (mode=%s)\n", playerName, roomCode, mode)
+	}
 
 	defer func() {
 		log.Printf("[WS] %s disconnected from room %s\n", playerName, roomCode)
 
 		room.mu.Lock()
-		delete(room.Players, playerID)
-		if room.HostID == playerID {
-			room.HostID = ""
-			for id := range room.Players {
-				room.HostID = id
-				break
+		p := room.Players[playerID]
+		if p != nil {
+			// Only clear if this disconnect belongs to the live connection
+			// (avoid a stale defer clobbering a fresh re-attach).
+			if p.Conn == c {
+				p.Connected = false
+				p.Conn = nil
+			} else {
+				// This seat was already re-attached by a newer connection.
+				room.mu.Unlock()
+				return
 			}
 		}
-		if room.JudgeID == playerID {
+
+		wasJudge := room.JudgeID == playerID
+		wasInsider := room.InsiderID == playerID
+		activeRound := room.State == "assign_roles" || room.State == "countdown" || room.State == "voting"
+
+		// Host transfer: if the host went offline, hand it to a connected player.
+		if room.HostID == playerID {
+			room.HostID = ""
+			for id, pp := range room.Players {
+				if pp.Connected {
+					room.HostID = id
+					break
+				}
+			}
+			if room.HostID == "" {
+				// No one online: keep seat as host so it can reclaim on reconnect.
+				room.HostID = playerID
+			}
+		}
+
+		// In lobby, a judge leaving frees the judge slot so a new one can be picked.
+		if room.JudgeID == playerID && !activeRound {
 			room.JudgeID = ""
 		}
+
+		// T5: void the round if the judge or insider drops mid-round.
+		voided := false
+		if activeRound && (wasJudge || wasInsider) {
+			room.timerRunning = false
+			if room.timerCancel != nil {
+				close(room.timerCancel)
+				room.timerCancel = nil
+			}
+			room.State = "lobby"
+			room.InsiderID = ""
+			room.SecretWord = ""
+			room.JudgeID = ""
+			for _, pp := range room.Players {
+				pp.Role = ""
+			}
+			room.Votes = make(map[string]string)
+			room.Voted = make(map[string]bool)
+			room.BlockedVoters = make(map[string]bool)
+			room.LastVotes = []VotePair{}
+			room.RoundEndByTimeout = false
+			room.CorrectGuesserID = ""
+			room.Hints = nil
+			room.QuestionCount = 0
+			voided = true
+		}
+
+		noConnected := countConnected(room) == 0
 		room.mu.Unlock()
 
+		if noConnected {
+			// No one is left connected — drop the room to avoid leaking memory.
+			deleteRoom(room)
+			return
+		}
+
+		if voided {
+			broadcastNotice(room, "รอบถูกยกเลิกเพราะ Judge หรือ Insider หลุดการเชื่อมต่อ")
+		}
 		broadcastRoom(room)
-		deleteRoomIfEmpty(room)
 	}()
 
 	for {
@@ -613,8 +857,22 @@ func wsHandler(c *websocket.Conn) {
 		switch msg.Type {
 		case "set_judge":
 			room.mu.Lock()
-			if _, ok := room.Players[msg.TargetID]; ok {
+			if room.HostID != playerID {
+				room.mu.Unlock()
+				sendError(c, "เฉพาะ Host เท่านั้นที่ตั้งกรรมการได้")
+				continue
+			}
+			if room.State != "lobby" {
+				room.mu.Unlock()
+				sendError(c, "ตั้งกรรมการได้เฉพาะตอนอยู่ใน Lobby")
+				continue
+			}
+			if target, ok := room.Players[msg.TargetID]; ok && target.Connected && !target.Spectator {
 				room.JudgeID = msg.TargetID
+			} else {
+				room.mu.Unlock()
+				sendError(c, "ผู้เล่นที่เลือกไม่อยู่ในห้อง ออฟไลน์ หรือเป็นผู้ชม")
+				continue
 			}
 			room.mu.Unlock()
 			broadcastRoom(room)
@@ -640,23 +898,46 @@ func wsHandler(c *websocket.Conn) {
 			}
 
 			room.mu.Lock()
-			totalPlayers := len(room.Players)
-			hasJudge := room.JudgeID != ""
-			nonJudgeCount := totalPlayers
-			if hasJudge {
-				nonJudgeCount = totalPlayers - 1
+			// T2: only the judge may start the round (matches the UI).
+			if room.JudgeID != playerID {
+				room.mu.Unlock()
+				sendError(c, "เฉพาะกรรมการเท่านั้นที่เริ่มรอบได้")
+				continue
 			}
-			room.SecretWord = msg.SecretWord
-			room.mu.Unlock()
-
-			if msg.SecretWord == "" {
+			if room.State != "lobby" {
+				room.mu.Unlock()
+				sendError(c, "เริ่มรอบได้เฉพาะตอนอยู่ใน Lobby")
+				continue
+			}
+			// T3/T2: validate BEFORE mutating room state.
+			secret := strings.TrimSpace(msg.SecretWord)
+			// T7: random word from the server-side word bank.
+			if secret == "" && msg.Random {
+				secret = pickRandomWord(msg.Category)
+			}
+			hasJudge := room.JudgeID != ""
+			nonJudgeCount := 0
+			for id, p := range room.Players {
+				if id == room.JudgeID {
+					continue
+				}
+				if p.Spectator || !p.Connected {
+					continue
+				}
+				nonJudgeCount++
+			}
+			if secret == "" {
+				room.mu.Unlock()
 				sendError(c, "กรรมการต้องกำหนดคำปริศนาก่อนเริ่มเกม")
 				continue
 			}
 			if !hasJudge || nonJudgeCount < 3 {
+				room.mu.Unlock()
 				sendError(c, "ต้องมีผู้เล่น (ไม่นับกรรมการ) อย่างน้อย 3 คน")
 				continue
 			}
+			room.SecretWord = secret
+			room.mu.Unlock()
 
 			assignRoles(room)
 			broadcastRoom(room)
@@ -665,12 +946,26 @@ func wsHandler(c *websocket.Conn) {
 		case "guess_correct":
 			room.mu.Lock()
 			isJudge := room.JudgeID == playerID
-			room.mu.Unlock()
 			if !isJudge {
+				room.mu.Unlock()
 				sendError(c, "เฉพาะกรรมการเท่านั้นที่กดทายถูกได้")
 				continue
 			}
-			handleGuessCorrect(room, msg.CorrectGuesserID)
+			if room.State != "countdown" {
+				room.mu.Unlock()
+				sendError(c, "ยังไม่อยู่ในช่วงเล่น")
+				continue
+			}
+			// T3: validate correctGuesserId (must be a real, non-judge player).
+			guesser := msg.CorrectGuesserID
+			if guesser != "" {
+				gp, ok := room.Players[guesser]
+				if !ok || guesser == room.JudgeID || gp == nil {
+					guesser = ""
+				}
+			}
+			room.mu.Unlock()
+			handleGuessCorrect(room, guesser)
 
 		case "vote_insider":
 			if msg.SuspectID == "" {
@@ -692,6 +987,12 @@ func wsHandler(c *websocket.Conn) {
 				continue
 			}
 
+			if self := room.Players[playerID]; self != nil && self.Spectator {
+				room.mu.Unlock()
+				sendError(c, "ผู้ชมไม่สามารถโหวตได้")
+				continue
+			}
+
 			if room.BlockedVoters != nil && room.BlockedVoters[playerID] {
 				room.mu.Unlock()
 				sendError(c, "คุณอยู่ในกลุ่มที่ถูกสงสัย จึงไม่มีสิทธิ์โหวตรอบนี้")
@@ -704,7 +1005,7 @@ func wsHandler(c *websocket.Conn) {
 				continue
 			}
 
-			if _, ok := room.Players[msg.SuspectID]; !ok {
+			if sp, ok := room.Players[msg.SuspectID]; !ok || sp.Spectator || msg.SuspectID == room.JudgeID {
 				room.mu.Unlock()
 				sendError(c, "invalid suspectId")
 				continue
@@ -721,17 +1022,8 @@ func wsHandler(c *websocket.Conn) {
 			}
 			room.Voted[playerID] = true
 
-			// คำนวณจำนวน "คนที่มีสิทธิ์โหวตจริง ๆ"
-			eligible := 0
-			for id := range room.Players {
-				if id == room.JudgeID {
-					continue
-				}
-				if room.BlockedVoters != nil && room.BlockedVoters[id] {
-					continue
-				}
-				eligible++
-			}
+			// T6: only connected, non-judge, non-blocked players count as eligible.
+			eligible := eligibleVoters(room)
 
 			if len(room.Votes) >= eligible && eligible > 0 {
 				if room.timerRunning {
@@ -745,13 +1037,19 @@ func wsHandler(c *websocket.Conn) {
 				needRevote := handleTallyVotes(room)
 				broadcastRoom(room)
 				if needRevote {
-					room.mu.Lock()
-					newDuration := room.voteTimerDuration / 2
-					if newDuration < 15 {
-						newDuration = 15
+					if eligibleVoters(room) == 0 {
+						// Deadlock: no eligible voters remain after blocking tied players — resolve immediately
+						handleTallyVotes(room)
+						broadcastRoom(room)
+					} else {
+						room.mu.Lock()
+						newDuration := room.voteTimerDuration / 2
+						if newDuration < 15 {
+							newDuration = 15
+						}
+						room.mu.Unlock()
+						startVoteTimer(room, newDuration)
 					}
-					room.mu.Unlock()
-					startVoteTimer(room, newDuration)
 				}
 			} else {
 				room.mu.Unlock()
@@ -759,6 +1057,13 @@ func wsHandler(c *websocket.Conn) {
 			}
 
 		case "next_round":
+			room.mu.Lock()
+			isHost := room.HostID == playerID
+			room.mu.Unlock()
+			if !isHost {
+				sendError(c, "เฉพาะ Host เท่านั้นที่เริ่มรอบถัดไปได้")
+				continue
+			}
 			handleNextRound(room)
 			broadcastRoom(room)
 
@@ -806,23 +1111,35 @@ func wsHandler(c *websocket.Conn) {
 			}
 
 			broadcastRoom(room)
-			deleteRoomIfEmpty(room)
 
 		case "chat":
 			txt := strings.TrimSpace(msg.Text)
 			if txt == "" {
 				continue
 			}
-			if len(txt) > 300 {
-				txt = txt[:300]
+			if len(txt) > MaxChatLen {
+				txt = txt[:MaxChatLen]
 			}
 
 			room.mu.Lock()
 			enabled := room.ChatEnabled
 			sender, ok := room.Players[playerID]
+			// T12: simple per-player chat rate limit.
+			rateLimited := false
+			if ok && sender != nil {
+				now := time.Now()
+				if !sender.lastChat.IsZero() && now.Sub(sender.lastChat) < ChatMinInterval {
+					rateLimited = true
+				} else {
+					sender.lastChat = now
+				}
+			}
 			room.mu.Unlock()
 
 			if !ok || sender == nil {
+				continue
+			}
+			if rateLimited {
 				continue
 			}
 
@@ -841,6 +1158,86 @@ func wsHandler(c *websocket.Conn) {
 				Ts:   time.Now().Unix(),
 			}
 
+			room.mu.Lock()
+			for _, p := range room.Players {
+				if p.Conn == nil {
+					continue
+				}
+				_ = p.Conn.WriteJSON(payload)
+			}
+			room.mu.Unlock()
+
+		case "add_hint":
+			// T8: กรรมการโพสต์ "ใบ้" สาธารณะระหว่างเล่น (ไม่ใช่คำลับ)
+			hint := strings.TrimSpace(msg.Text)
+			if hint == "" {
+				continue
+			}
+			if len([]rune(hint)) > MaxHintLen {
+				hint = string([]rune(hint)[:MaxHintLen])
+			}
+			room.mu.Lock()
+			if room.JudgeID != playerID {
+				room.mu.Unlock()
+				sendError(c, "เฉพาะกรรมการเท่านั้นที่ให้ใบ้ได้")
+				continue
+			}
+			if room.State != "countdown" {
+				room.mu.Unlock()
+				sendError(c, "ให้ใบ้ได้เฉพาะตอนกำลังเล่น")
+				continue
+			}
+			if len(room.Hints) >= MaxHints {
+				room.mu.Unlock()
+				sendError(c, "ให้ใบ้ครบจำนวนสูงสุดแล้ว")
+				continue
+			}
+			room.Hints = append(room.Hints, hint)
+			room.mu.Unlock()
+			broadcastRoom(room)
+
+		case "ask_question":
+			// T8: ตัวนับจำนวนคำถาม (ข้อมูลช่วยจับจังหวะเกม)
+			room.mu.Lock()
+			self := room.Players[playerID]
+			if self == nil || self.Spectator || room.State != "countdown" {
+				room.mu.Unlock()
+				continue
+			}
+			room.QuestionCount++
+			room.mu.Unlock()
+			broadcastRoom(room)
+
+		case "react":
+			// T10: emoji reaction ชั่วคราว (ไม่กระทบ state ตัดสิน)
+			emoji := strings.TrimSpace(msg.Emoji)
+			if emoji == "" {
+				continue
+			}
+			if len([]rune(emoji)) > MaxEmojiLen {
+				emoji = string([]rune(emoji)[:MaxEmojiLen])
+			}
+			room.mu.Lock()
+			sender, ok := room.Players[playerID]
+			rateLimited := false
+			if ok && sender != nil {
+				now := time.Now()
+				if !sender.lastReact.IsZero() && now.Sub(sender.lastReact) < ReactMinInterval {
+					rateLimited = true
+				} else {
+					sender.lastReact = now
+				}
+			}
+			room.mu.Unlock()
+			if !ok || sender == nil || rateLimited {
+				continue
+			}
+			payload := ReactionPayload{
+				Type:  "reaction",
+				From:  ChatFrom{ID: sender.ID, Name: sender.Name},
+				Emoji: emoji,
+				Ts:    time.Now().Unix(),
+			}
 			room.mu.Lock()
 			for _, p := range room.Players {
 				if p.Conn == nil {
