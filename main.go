@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"log"
 	"math/rand"
@@ -10,7 +11,9 @@ import (
 	"sync"
 	"time"
 
+	rtctokenbuilder "github.com/AgoraIO/Tools/DynamicKey/AgoraDynamicKey/go/src/rtctokenbuilder2"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/websocket/v2"
 )
 
@@ -944,6 +947,26 @@ func wsHandler(c *websocket.Conn) {
 			broadcastRoom(room)
 			startCountdownTimer(room, msg.Duration)
 
+		case "guess_word":
+			room.mu.Lock()
+			if room.State != "countdown" {
+				room.mu.Unlock()
+				continue
+			}
+			guess := strings.ToLower(strings.TrimSpace(msg.Text))
+			secret := strings.ToLower(strings.TrimSpace(room.SecretWord))
+			if guess == "" || secret == "" {
+				room.mu.Unlock()
+				continue
+			}
+			if strings.Contains(guess, secret) {
+				room.mu.Unlock()
+				log.Printf("[SPEECH] Correct guess by player %s in room %s: %s contains %s\n", playerID, room.Code, guess, secret)
+				handleGuessCorrect(room, playerID)
+			} else {
+				room.mu.Unlock()
+			}
+
 		case "guess_correct":
 			room.mu.Lock()
 			isJudge := room.JudgeID == playerID
@@ -1254,9 +1277,81 @@ func wsHandler(c *websocket.Conn) {
 	}
 }
 
+func loadEnv() {
+	file, err := os.Open(".env")
+	if err != nil {
+		return // no .env file, ignore
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			val = strings.Trim(val, `"'`)
+			os.Setenv(key, val)
+		}
+	}
+}
+
 func main() {
+	loadEnv()
+
 	app := fiber.New()
+
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept",
+	}))
+
 	app.Get("/ws", websocket.New(wsHandler))
+
+	app.Get("/api/agora-token", func(c *fiber.Ctx) error {
+		channelName := c.Query("channelName")
+		uid := c.Query("uid")
+		if channelName == "" || uid == "" {
+			return c.Status(400).JSON(fiber.Map{
+				"error": "missing channelName or uid",
+			})
+		}
+
+		appID := os.Getenv("AGORA_APP_ID")
+		appCertificate := os.Getenv("AGORA_APP_CERTIFICATE")
+
+		if appID == "" || appCertificate == "" {
+			return c.Status(500).JSON(fiber.Map{
+				"error": "Agora credentials are not configured on the server",
+			})
+		}
+
+		// Token expires in 2 hours
+		expireTimeInSeconds := uint32(7200)
+
+		token, err := rtctokenbuilder.BuildTokenWithUserAccount(
+			appID,
+			appCertificate,
+			channelName,
+			uid,
+			rtctokenbuilder.RolePublisher,
+			expireTimeInSeconds,
+			expireTimeInSeconds,
+		)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{
+				"error": "failed to generate token: " + err.Error(),
+			})
+		}
+
+		return c.JSON(fiber.Map{
+			"token": token,
+		})
+	})
 
 	port := os.Getenv("PORT")
 	if port == "" {
