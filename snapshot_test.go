@@ -75,10 +75,10 @@ func TestInsiderRevealedOnScoreboard(t *testing.T) {
 	if snap.InsiderID != insiderID {
 		t.Errorf("on scoreboard, insiderId should be revealed=%q, got %q", insiderID, snap.InsiderID)
 	}
-	// Secret word is fine to reveal on the scoreboard too? No — we still only
-	// send it to judge/insider. Commons should still not get it here.
-	if snap.SecretWord != "" {
-		t.Errorf("commons still should not receive secretWord via snapshot, got %q", snap.SecretWord)
+	// On the scoreboard the round is over, so the answer is revealed to everyone
+	// (the UI promises to show the secret word at the end of the round).
+	if snap.SecretWord != "ส้มตำ" {
+		t.Errorf("on scoreboard, commons should now see the revealed secretWord, got %q", snap.SecretWord)
 	}
 }
 

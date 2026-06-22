@@ -42,6 +42,12 @@ type Room struct {
 	RoundEndByTimeout bool   `json:"roundEndByTimeout"`
 	ChatEnabled       bool   `json:"chatEnabled"`
 
+	// RoundResult is the server-authoritative outcome of the finished round so
+	// the client never has to recompute the winner from raw votes:
+	//   "commons" = insider caught, "insider" = insider survived,
+	//   "timeout" = word never guessed, "" = no decisive result yet.
+	RoundResult string `json:"roundResult,omitempty"`
+
 	CorrectGuesserID string `json:"correctGuesserId,omitempty"`
 
 	Hints         []string `json:"hints,omitempty"`         // T8: ใบ้สาธารณะจากกรรมการ
@@ -250,6 +256,7 @@ func buildSnapshotFor(room *Room, viewerID string) *Room {
 		JudgeID:           room.JudgeID,
 		Timer:             room.Timer,
 		RoundEndByTimeout: room.RoundEndByTimeout,
+		RoundResult:       room.RoundResult,
 		ChatEnabled:       room.ChatEnabled,
 		CorrectGuesserID:  room.CorrectGuesserID,
 		Hints:             append([]string(nil), room.Hints...),
@@ -396,6 +403,7 @@ func startCountdownTimer(room *Room, duration int) {
 	room.timerCancel = make(chan struct{})
 
 	room.RoundEndByTimeout = false
+	room.RoundResult = ""
 	room.CorrectGuesserID = ""
 	room.BlockedVoters = make(map[string]bool)
 	room.Voted = make(map[string]bool)
@@ -427,6 +435,7 @@ func startCountdownTimer(room *Room, duration int) {
 					r.timerRunning = false
 					r.State = "scoreboard"
 					r.RoundEndByTimeout = true
+					r.RoundResult = "timeout"
 					r.Votes = make(map[string]string)
 					r.mu.Unlock()
 					broadcastRoom(r)
@@ -590,6 +599,8 @@ func handleTallyVotes(room *Room) bool {
 
 	isCorrect := votedID == room.InsiderID
 	if isCorrect {
+		// Commons win: every common (not insider/judge/correct-guesser) gets +1.
+		room.RoundResult = "commons"
 		for _, p := range room.Players {
 			if p.ID == room.InsiderID || p.ID == room.JudgeID || p.ID == room.CorrectGuesserID {
 				continue
@@ -597,8 +608,15 @@ func handleTallyVotes(room *Room) bool {
 			p.Score++
 		}
 	} else {
+		// Insider survives: insider +2 and the player who guessed the word gets +1.
+		room.RoundResult = "insider"
 		if ins, ok := room.Players[room.InsiderID]; ok {
 			ins.Score += 2
+		}
+		if room.CorrectGuesserID != "" {
+			if g, ok := room.Players[room.CorrectGuesserID]; ok {
+				g.Score++
+			}
 		}
 	}
 
@@ -607,6 +625,33 @@ func handleTallyVotes(room *Room) bool {
 	room.Voted = make(map[string]bool)
 	room.BlockedVoters = make(map[string]bool)
 	return false
+}
+
+// voidRound aborts an in-progress round and returns the room to the lobby.
+// Used when the judge or insider leaves/disconnects/gets kicked mid-round, so
+// the game never hangs with a dangling JudgeID/InsiderID. Caller must hold room.mu.
+func voidRound(room *Room) {
+	room.timerRunning = false
+	if room.timerCancel != nil {
+		close(room.timerCancel)
+		room.timerCancel = nil
+	}
+	room.State = "lobby"
+	room.InsiderID = ""
+	room.SecretWord = ""
+	room.JudgeID = ""
+	for _, pp := range room.Players {
+		pp.Role = ""
+	}
+	room.Votes = make(map[string]string)
+	room.Voted = make(map[string]bool)
+	room.BlockedVoters = make(map[string]bool)
+	room.LastVotes = []VotePair{}
+	room.RoundEndByTimeout = false
+	room.RoundResult = ""
+	room.CorrectGuesserID = ""
+	room.Hints = nil
+	room.QuestionCount = 0
 }
 
 func handleNextRound(room *Room) {
@@ -650,6 +695,7 @@ func handleNextRound(room *Room) {
 	room.SecretWord = ""
 	room.Votes = make(map[string]string)
 	room.RoundEndByTimeout = false
+	room.RoundResult = ""
 	room.CorrectGuesserID = ""
 	room.BlockedVoters = make(map[string]bool)
 	room.Voted = make(map[string]bool)
@@ -772,8 +818,12 @@ func wsHandler(c *websocket.Conn) {
 			// Only clear if this disconnect belongs to the live connection
 			// (avoid a stale defer clobbering a fresh re-attach).
 			if p.Conn == c {
-				p.Connected = false
-				p.Conn = nil
+				if room.State == "lobby" {
+					delete(room.Players, playerID)
+				} else {
+					p.Connected = false
+					p.Conn = nil
+				}
 			} else {
 				// This seat was already re-attached by a newer connection.
 				room.mu.Unlock()
@@ -808,26 +858,7 @@ func wsHandler(c *websocket.Conn) {
 		// T5: void the round if the judge or insider drops mid-round.
 		voided := false
 		if activeRound && (wasJudge || wasInsider) {
-			room.timerRunning = false
-			if room.timerCancel != nil {
-				close(room.timerCancel)
-				room.timerCancel = nil
-			}
-			room.State = "lobby"
-			room.InsiderID = ""
-			room.SecretWord = ""
-			room.JudgeID = ""
-			for _, pp := range room.Players {
-				pp.Role = ""
-			}
-			room.Votes = make(map[string]string)
-			room.Voted = make(map[string]bool)
-			room.BlockedVoters = make(map[string]bool)
-			room.LastVotes = []VotePair{}
-			room.RoundEndByTimeout = false
-			room.CorrectGuesserID = ""
-			room.Hints = nil
-			room.QuestionCount = 0
+			voidRound(room)
 			voided = true
 		}
 
@@ -935,9 +966,9 @@ func wsHandler(c *websocket.Conn) {
 				sendError(c, "กรรมการต้องกำหนดคำปริศนาก่อนเริ่มเกม")
 				continue
 			}
-			if !hasJudge || nonJudgeCount < 2 {
+			if !hasJudge || nonJudgeCount < 3 {
 				room.mu.Unlock()
-				sendError(c, "ต้องมีผู้เล่น (ไม่นับกรรมการ) อย่างน้อย 2 คน (ต้องการผู้เล่นทั้งหมดอย่างน้อย 3 คนขึ้นไป)")
+				sendError(c, "ต้องมีผู้เล่น (ไม่นับกรรมการ) อย่างน้อย 3 คน รวมทั้งหมดอย่างน้อย 4 คนขึ้นไปจึงจะเริ่มได้")
 				continue
 			}
 			room.SecretWord = secret
@@ -1119,11 +1150,23 @@ func wsHandler(c *websocket.Conn) {
 				continue
 			}
 
+			// Capture role flags before mutating, so kicking the judge/insider
+			// mid-round voids the round instead of leaving the game hung.
+			wasJudge := room.JudgeID == msg.TargetID
+			wasInsider := room.InsiderID == msg.TargetID
+			activeRound := room.State == "assign_roles" || room.State == "countdown" || room.State == "voting"
+
 			if room.JudgeID == msg.TargetID {
 				room.JudgeID = ""
 			}
 
 			delete(room.Players, msg.TargetID)
+
+			voided := false
+			if activeRound && (wasJudge || wasInsider) {
+				voidRound(room)
+				voided = true
+			}
 			room.mu.Unlock()
 
 			if target.Conn != nil {
@@ -1134,6 +1177,9 @@ func wsHandler(c *websocket.Conn) {
 				_ = target.Conn.Close()
 			}
 
+			if voided {
+				broadcastNotice(room, "รอบถูกยกเลิกเพราะ Judge หรือ Insider ถูกเชิญออกจากห้อง")
+			}
 			broadcastRoom(room)
 
 		case "chat":
@@ -1270,6 +1316,46 @@ func wsHandler(c *websocket.Conn) {
 				_ = p.Conn.WriteJSON(payload)
 			}
 			room.mu.Unlock()
+
+		case "leave":
+			room.mu.Lock()
+			// Capture role flags BEFORE we mutate JudgeID / delete the player,
+			// otherwise a leaving judge would never trigger the round void.
+			wasJudge := room.JudgeID == playerID
+			wasInsider := room.InsiderID == playerID
+			activeRound := room.State == "assign_roles" || room.State == "countdown" || room.State == "voting"
+
+			// Host transfer if leaving player was host
+			if room.HostID == playerID {
+				room.HostID = ""
+				for id, pp := range room.Players {
+					if id != playerID && pp.Connected {
+						room.HostID = id
+						break
+					}
+				}
+			}
+			if room.JudgeID == playerID {
+				room.JudgeID = ""
+			}
+			delete(room.Players, playerID)
+
+			voided := false
+			if activeRound && (wasJudge || wasInsider) {
+				voidRound(room)
+				voided = true
+			}
+			noConnected := countConnected(room) == 0
+			room.mu.Unlock()
+
+			if noConnected {
+				deleteRoom(room)
+				return
+			}
+			if voided {
+				broadcastNotice(room, "รอบถูกยกเลิกเพราะ Judge หรือ Insider ออกจากห้อง")
+			}
+			broadcastRoom(room)
 
 		default:
 			sendError(c, "unknown message type: "+msg.Type)
