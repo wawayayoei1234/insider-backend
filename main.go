@@ -261,8 +261,8 @@ func buildSnapshotFor(room *Room, viewerID string) *Room {
 		Players:       make(map[string]*Player),
 	}
 
-	// Secret word: only judge + insider may see it.
-	if viewerID == room.JudgeID || viewerID == room.InsiderID {
+	// Secret word: only judge + insider may see it during play, but revealed to everyone on scoreboard phase.
+	if viewerID == room.JudgeID || viewerID == room.InsiderID || room.State == "scoreboard" {
 		snap.SecretWord = room.SecretWord
 	}
 
@@ -935,9 +935,9 @@ func wsHandler(c *websocket.Conn) {
 				sendError(c, "กรรมการต้องกำหนดคำปริศนาก่อนเริ่มเกม")
 				continue
 			}
-			if !hasJudge || nonJudgeCount < 1 {
+			if !hasJudge || nonJudgeCount < 2 {
 				room.mu.Unlock()
-				sendError(c, "ต้องมีผู้เล่น (ไม่นับกรรมการ) อย่างน้อย 1 คน")
+				sendError(c, "ต้องมีผู้เล่น (ไม่นับกรรมการ) อย่างน้อย 2 คน (ต้องการผู้เล่นทั้งหมดอย่างน้อย 3 คนขึ้นไป)")
 				continue
 			}
 			room.SecretWord = secret
