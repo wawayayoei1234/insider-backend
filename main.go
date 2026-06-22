@@ -675,7 +675,7 @@ func handleNextRound(room *Room) {
 	if _, ok := room.Players[room.HostID]; !ok || room.HostID == "" {
 		room.HostID = ""
 		for id, p := range room.Players {
-			if p.Connected {
+			if p.Connected && !p.Spectator {
 				room.HostID = id
 				break
 			}
@@ -841,7 +841,7 @@ func wsHandler(c *websocket.Conn) {
 		if room.HostID == playerID {
 			room.HostID = ""
 			for id, pp := range room.Players {
-				if pp.Connected {
+				if pp.Connected && !pp.Spectator {
 					room.HostID = id
 					break
 				}
@@ -1190,11 +1190,30 @@ func wsHandler(c *websocket.Conn) {
 			}
 
 			delete(room.Players, msg.TargetID)
+			if room.Votes != nil {
+				delete(room.Votes, msg.TargetID)
+			}
+			if room.Voted != nil {
+				delete(room.Voted, msg.TargetID)
+			}
 
 			voided := false
 			if activeRound && (wasJudge || wasInsider) {
 				voidRound(room)
 				voided = true
+			}
+
+			tallyNow := false
+			if room.State == "voting" {
+				eligible := eligibleVoters(room)
+				if len(room.Votes) >= eligible {
+					tallyNow = true
+					room.timerRunning = false
+					if room.timerCancel != nil {
+						close(room.timerCancel)
+						room.timerCancel = nil
+					}
+				}
 			}
 			room.mu.Unlock()
 
@@ -1209,7 +1228,27 @@ func wsHandler(c *websocket.Conn) {
 			if voided {
 				broadcastNotice(room, "รอบถูกยกเลิกเพราะ Judge หรือ Insider ถูกเชิญออกจากห้อง")
 			}
-			broadcastRoom(room)
+
+			if tallyNow {
+				needRevote := handleTallyVotes(room)
+				broadcastRoom(room)
+				if needRevote {
+					if eligibleVoters(room) == 0 {
+						handleTallyVotes(room)
+						broadcastRoom(room)
+					} else {
+						room.mu.Lock()
+						newDuration := room.voteTimerDuration / 2
+						if newDuration < 15 {
+							newDuration = 15
+						}
+						room.mu.Unlock()
+						startVoteTimer(room, newDuration)
+					}
+				}
+			} else {
+				broadcastRoom(room)
+			}
 
 		case "chat":
 			txt := strings.TrimSpace(msg.Text)
@@ -1358,7 +1397,7 @@ func wsHandler(c *websocket.Conn) {
 			if room.HostID == playerID {
 				room.HostID = ""
 				for id, pp := range room.Players {
-					if id != playerID && pp.Connected {
+					if id != playerID && pp.Connected && !pp.Spectator {
 						room.HostID = id
 						break
 					}
@@ -1368,6 +1407,12 @@ func wsHandler(c *websocket.Conn) {
 				room.JudgeID = ""
 			}
 			delete(room.Players, playerID)
+			if room.Votes != nil {
+				delete(room.Votes, playerID)
+			}
+			if room.Voted != nil {
+				delete(room.Voted, playerID)
+			}
 
 			voided := false
 			if activeRound && (wasJudge || wasInsider) {
@@ -1375,6 +1420,19 @@ func wsHandler(c *websocket.Conn) {
 				voided = true
 			}
 			noConnected := countConnected(room) == 0
+
+			tallyNow := false
+			if room.State == "voting" {
+				eligible := eligibleVoters(room)
+				if len(room.Votes) >= eligible {
+					tallyNow = true
+					room.timerRunning = false
+					if room.timerCancel != nil {
+						close(room.timerCancel)
+						room.timerCancel = nil
+					}
+				}
+			}
 			room.mu.Unlock()
 
 			if noConnected {
@@ -1384,7 +1442,27 @@ func wsHandler(c *websocket.Conn) {
 			if voided {
 				broadcastNotice(room, "รอบถูกยกเลิกเพราะ Judge หรือ Insider ออกจากห้อง")
 			}
-			broadcastRoom(room)
+
+			if tallyNow {
+				needRevote := handleTallyVotes(room)
+				broadcastRoom(room)
+				if needRevote {
+					if eligibleVoters(room) == 0 {
+						handleTallyVotes(room)
+						broadcastRoom(room)
+					} else {
+						room.mu.Lock()
+						newDuration := room.voteTimerDuration / 2
+						if newDuration < 15 {
+							newDuration = 15
+						}
+						room.mu.Unlock()
+						startVoteTimer(room, newDuration)
+					}
+				}
+			} else {
+				broadcastRoom(room)
+			}
 
 		default:
 			sendError(c, "unknown message type: "+msg.Type)
