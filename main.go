@@ -181,8 +181,18 @@ func getOrCreateRoom(code string, create bool) (*Room, bool) {
 
 func deleteRoom(room *Room) {
 	roomsMu.Lock()
-	defer roomsMu.Unlock()
 	delete(rooms, room.Code)
+	roomsMu.Unlock()
+
+	room.mu.Lock()
+	if room.timerRunning {
+		room.timerRunning = false
+		if room.timerCancel != nil {
+			close(room.timerCancel)
+			room.timerCancel = nil
+		}
+	}
+	room.mu.Unlock()
 }
 
 func makePlayerID() string {
@@ -355,9 +365,6 @@ func sendError(conn *websocket.Conn, text string) {
 }
 
 func assignRoles(room *Room) {
-	room.mu.Lock()
-	defer room.mu.Unlock()
-
 	room.InsiderID = ""
 	for _, p := range room.Players {
 		if p.Spectator {
@@ -394,7 +401,6 @@ func assignRoles(room *Room) {
 }
 
 func startCountdownTimer(room *Room, duration int) {
-	room.mu.Lock()
 	if room.timerCancel != nil {
 		close(room.timerCancel)
 	}
@@ -413,7 +419,6 @@ func startCountdownTimer(room *Room, duration int) {
 	room.QuestionCount = 0
 
 	cancelChan := room.timerCancel
-	room.mu.Unlock()
 
 	go func(r *Room, cancel <-chan struct{}) {
 		ticker := time.NewTicker(time.Second)
@@ -553,6 +558,15 @@ func handleTallyVotes(room *Room) bool {
 		room.Votes = make(map[string]string)
 		room.Voted = make(map[string]bool)
 		room.BlockedVoters = make(map[string]bool)
+		room.RoundResult = "insider"
+		if ins, ok := room.Players[room.InsiderID]; ok {
+			ins.Score += 2
+		}
+		if room.CorrectGuesserID != "" {
+			if g, ok := room.Players[room.CorrectGuesserID]; ok {
+				g.Score++
+			}
+		}
 		return false
 	}
 
@@ -1001,11 +1015,11 @@ func wsHandler(c *websocket.Conn) {
 				continue
 			}
 			room.SecretWord = secret
+			assignRoles(room)
+			startCountdownTimer(room, msg.Duration)
 			room.mu.Unlock()
 
-			assignRoles(room)
 			broadcastRoom(room)
-			startCountdownTimer(room, msg.Duration)
 
 		case "guess_word":
 			room.mu.Lock()
