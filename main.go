@@ -34,6 +34,7 @@ type Room struct {
 	Code      string `json:"code"`
 	State     string `json:"state"`
 	HostID    string `json:"hostId"`
+	CreatorID string `json:"creatorId,omitempty"`
 	JudgeID   string `json:"judgeId"`
 	InsiderID string `json:"insiderId"`
 	Timer     int    `json:"timer"`
@@ -768,8 +769,8 @@ func wsHandler(c *websocket.Conn) {
 		player.Name = playerName
 		reattached = true
 		// Restore host if the seat had become host while offline-less, or if no host
-		// (spectators never become host).
-		if room.HostID == "" && !player.Spectator {
+		// (spectators never become host). Or if the returning player is the creator.
+		if (room.HostID == "" || (room.HostID != player.ID && player.ID == room.CreatorID)) && !player.Spectator {
 			room.HostID = player.ID
 		}
 	} else {
@@ -795,6 +796,7 @@ func wsHandler(c *websocket.Conn) {
 		room.Players[playerID] = player
 		if room.HostID == "" && !isSpectator {
 			room.HostID = playerID
+			room.CreatorID = playerID
 		}
 	}
 	playerID := player.ID
@@ -863,6 +865,18 @@ func wsHandler(c *websocket.Conn) {
 		}
 
 		noConnected := countConnected(room) == 0
+		tallyNow := false
+		if room.State == "voting" {
+			eligible := eligibleVoters(room)
+			if len(room.Votes) >= eligible {
+				tallyNow = true
+				room.timerRunning = false
+				if room.timerCancel != nil {
+					close(room.timerCancel)
+					room.timerCancel = nil
+				}
+			}
+		}
 		room.mu.Unlock()
 
 		if noConnected {
@@ -874,7 +888,22 @@ func wsHandler(c *websocket.Conn) {
 		if voided {
 			broadcastNotice(room, "รอบถูกยกเลิกเพราะ Judge หรือ Insider หลุดการเชื่อมต่อ")
 		}
-		broadcastRoom(room)
+
+		if tallyNow {
+			needRevote := handleTallyVotes(room)
+			broadcastRoom(room)
+			if needRevote {
+				room.mu.Lock()
+				newDuration := room.voteTimerDuration / 2
+				if newDuration < 15 {
+					newDuration = 15
+				}
+				room.mu.Unlock()
+				startVoteTimer(room, newDuration)
+			}
+		} else {
+			broadcastRoom(room)
+		}
 	}()
 
 	for {
@@ -1080,7 +1109,7 @@ func wsHandler(c *websocket.Conn) {
 			// T6: only connected, non-judge, non-blocked players count as eligible.
 			eligible := eligibleVoters(room)
 
-			if len(room.Votes) >= eligible && eligible > 0 {
+			if len(room.Votes) >= eligible {
 				if room.timerRunning {
 					room.timerRunning = false
 					if room.timerCancel != nil {
