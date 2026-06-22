@@ -26,8 +26,22 @@ type Player struct {
 	Spectator bool            `json:"spectator,omitempty"`
 	Token     string          `json:"-"`
 	Conn      *websocket.Conn `json:"-"`
+	writeMu   sync.Mutex      // gorilla/websocket allows only ONE concurrent writer per conn
 	lastChat  time.Time
 	lastReact time.Time
+}
+
+// writeJSON is the ONLY safe way to write to a player's socket. gorilla/websocket
+// panics / corrupts frames on concurrent writes, and writes happen from many
+// goroutines (the per-connection read loop, the round timer, other players'
+// actions). Serializing per-connection here prevents mid-game disconnects.
+func writeJSON(p *Player, v interface{}) {
+	if p == nil || p.Conn == nil {
+		return
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	_ = p.Conn.WriteJSON(v)
 }
 
 type Room struct {
@@ -324,7 +338,7 @@ func broadcastRoom(room *Room) {
 			continue
 		}
 		snap := buildSnapshotFor(room, p.ID)
-		_ = p.Conn.WriteJSON(OutgoingRoomMessage{
+		writeJSON(p, OutgoingRoomMessage{
 			Type: "room",
 			Room: snap,
 		})
@@ -343,7 +357,7 @@ func sendRoomToPlayer(room *Room, player *Player) {
 		Categories: categories(), // T7: ส่งรายชื่อหมวดครั้งเดียวตอน join
 		Room:       snap,
 	}
-	_ = player.Conn.WriteJSON(msg)
+	writeJSON(player, msg)
 }
 
 func broadcastNotice(room *Room, text string) {
@@ -353,7 +367,7 @@ func broadcastNotice(room *Room, text string) {
 		if p.Conn == nil {
 			continue
 		}
-		_ = p.Conn.WriteJSON(NoticeMessage{Type: "notice", Message: text})
+		writeJSON(p, NoticeMessage{Type: "notice", Message: text})
 	}
 }
 
@@ -920,6 +934,14 @@ func wsHandler(c *websocket.Conn) {
 		}
 	}()
 
+	// Shadow the package-level sendError for the read loop: now that this player
+	// is registered in the room, other goroutines may write to its socket, so all
+	// error replies must go through the per-connection write lock. (Pre-join error
+	// replies above still use the package sendError — safe, the conn is private then.)
+	sendError := func(_ *websocket.Conn, text string) {
+		writeJSON(player, ErrorMessage{Type: "error", Message: text})
+	}
+
 	for {
 		_, data, err := c.ReadMessage()
 		if err != nil {
@@ -933,7 +955,7 @@ func wsHandler(c *websocket.Conn) {
 
 		switch msg.Type {
 		case "ping":
-			_ = c.WriteJSON(map[string]string{"type": "pong"})
+			writeJSON(player, map[string]string{"type": "pong"})
 			continue
 
 		case "set_judge":
@@ -1236,7 +1258,7 @@ func wsHandler(c *websocket.Conn) {
 			room.mu.Unlock()
 
 			if target.Conn != nil {
-				_ = target.Conn.WriteJSON(ErrorMessage{
+				writeJSON(target, ErrorMessage{
 					Type:    "error",
 					Message: "คุณถูกเชิญออกจากห้องโดย Host",
 				})
@@ -1319,7 +1341,7 @@ func wsHandler(c *websocket.Conn) {
 				if p.Conn == nil {
 					continue
 				}
-				_ = p.Conn.WriteJSON(payload)
+				writeJSON(p, payload)
 			}
 			room.mu.Unlock()
 
@@ -1399,7 +1421,7 @@ func wsHandler(c *websocket.Conn) {
 				if p.Conn == nil {
 					continue
 				}
-				_ = p.Conn.WriteJSON(payload)
+				writeJSON(p, payload)
 			}
 			room.mu.Unlock()
 
