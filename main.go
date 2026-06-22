@@ -932,6 +932,10 @@ func wsHandler(c *websocket.Conn) {
 		}
 
 		switch msg.Type {
+		case "ping":
+			_ = c.WriteJSON(map[string]string{"type": "pong"})
+			continue
+
 		case "set_judge":
 			room.mu.Lock()
 			if room.HostID != playerID {
